@@ -45,6 +45,8 @@ namespace Config {
     constexpr DWORD HEARTBEAT_TIMEOUT = 10000;   // 10s - auto-unload if MC stops updating
     constexpr int SHM_SIZE            = 4096;
     constexpr int SOURCE_ENTRY_SIZE   = 45;
+    constexpr int MASTER_VOLUME_OFFSET = 2036;  // float, outside seqlock
+    constexpr int LIVE_ROTATION_OFFSET = 2040;  // live yaw/pitch outside seqlock
     constexpr int REQUEST_OFFSET      = 2048;  // DLL -> mod: requested player names
     constexpr int REQUEST_NAME_SIZE   = 17;    // 1 byte len + 16 bytes name
     constexpr int MAX_SOURCES         = (REQUEST_OFFSET - 25) / SOURCE_ENTRY_SIZE;  // must not overlap request area
@@ -65,13 +67,13 @@ GetAudioFrameFunc Original_GetAudioFrame = nullptr;
 //------------------------------------------
 HMODULE g_hModule = nullptr;
 static std::atomic<bool> g_shutdownFlag{ false };
+static std::atomic<uint64_t> g_hookProcessCount{ 0 };  // counts ProcessAudioData calls
 
 namespace FrameOff {
     constexpr int samples_per_channel = 0x18;
     constexpr int sample_rate_hz      = 0x20;
     constexpr int num_channels        = 0x28;
     constexpr int data_array          = 0x50;
-    constexpr int muted               = 0x3C50;
 }
 constexpr int REMOTE_SSRC_OFFSET = 0xF8;
 
@@ -326,7 +328,6 @@ static void SilenceAudioFrame(void* audio_frame) {
     size_t samples  = *(size_t*)(frame + FrameOff::samples_per_channel);
     size_t channels = *(size_t*)(frame + FrameOff::num_channels);
     int16_t* pcm    = (int16_t*)(frame + FrameOff::data_array);
-    *(char*)(frame + FrameOff::muted) = 1;
     if (pcm && samples > 0 && samples <= 7680 && channels > 0 && channels <= 2) {
         memset(pcm, 0, samples * channels * sizeof(int16_t));
     }
@@ -340,6 +341,7 @@ public:
     struct UserAudioData {
         ALuint source = 0;
         ULONGLONG lastWriteTime = 0;
+        bool positioned = false;
         int16_t* ringBuffer = nullptr;
         std::atomic<uint64_t> writePos{ 0 };
         std::atomic<uint64_t> readPos{ 0 };
@@ -354,6 +356,7 @@ public:
         UserAudioData& operator=(const UserAudioData&) = delete;
         UserAudioData(UserAudioData&& o) noexcept
             : source(o.source), lastWriteTime(o.lastWriteTime),
+              positioned(o.positioned),
               ringBuffer(o.ringBuffer) {
             writePos.store(o.writePos.load(std::memory_order_relaxed), std::memory_order_relaxed);
             readPos.store(o.readPos.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -363,6 +366,7 @@ public:
             if (this != &o) {
                 delete[] ringBuffer;
                 source = o.source; lastWriteTime = o.lastWriteTime;
+                positioned = o.positioned;
                 ringBuffer = o.ringBuffer;
                 writePos.store(o.writePos.load(std::memory_order_relaxed), std::memory_order_relaxed);
                 readPos.store(o.readPos.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -521,18 +525,37 @@ private:
         }
         if (!mgr->shmView) return;
 
+        // Always apply live rotation (outside seqlock, updated at ~500Hz)
+        {
+            float liveYaw, livePitch;
+            memcpy(&liveYaw,   mgr->shmView + Config::LIVE_ROTATION_OFFSET, 4);
+            memcpy(&livePitch, mgr->shmView + Config::LIVE_ROTATION_OFFSET + 4, 4);
+            float fx = -sinf(liveYaw) * cosf(livePitch);
+            float fy = -sinf(livePitch);
+            float fz = cosf(liveYaw) * cosf(livePitch);
+            ALfloat orientation[] = { fx, fy, fz, 0.0f, 1.0f, 0.0f };
+            alListenerfv(AL_ORIENTATION, orientation);
+        }
+
+        // Master volume from SHM (outside seqlock)
+        {
+            float vol;
+            memcpy(&vol, mgr->shmView + Config::MASTER_VOLUME_OFFSET, 4);
+            if (vol >= 0.0f && vol <= 2.0f) {
+                alListenerf(AL_GAIN, vol);
+            }
+        }
+
         // Seqlock: read seq, read data, re-read seq — discard if changed (torn read)
         uint32_t seq;
         memcpy(&seq, mgr->shmView, 4);
         if (seq == mgr->shmLastSeq) return;
 
-        // Listener
-        float lx, ly, lz, yaw, pitch;
-        memcpy(&lx,    mgr->shmView + 4,  4);
-        memcpy(&ly,    mgr->shmView + 8,  4);
-        memcpy(&lz,    mgr->shmView + 12, 4);
-        memcpy(&yaw,   mgr->shmView + 16, 4);
-        memcpy(&pitch, mgr->shmView + 20, 4);
+        // Listener position (rotation read from live area above)
+        float lx, ly, lz;
+        memcpy(&lx, mgr->shmView + 4,  4);
+        memcpy(&ly, mgr->shmView + 8,  4);
+        memcpy(&lz, mgr->shmView + 12, 4);
 
         // Phase 1: Read all source entries from SHM into local storage (stack, no heap)
         uint8_t numSources = mgr->shmView[24];
@@ -558,13 +581,8 @@ private:
         if (seq2 != seq) return;  // torn read, skip this tick
         mgr->shmLastSeq = seq;
 
-        // Phase 2: Apply listener position
+        // Phase 2: Apply listener position (rotation already applied above from live area)
         alListener3f(AL_POSITION, lx, ly, lz);
-        float fx = -sinf(yaw) * cosf(pitch);
-        float fy = -sinf(pitch);
-        float fz = cosf(yaw) * cosf(pitch);
-        ALfloat orientation[] = { fx, fy, fz, 0.0f, 1.0f, 0.0f };
-        alListenerfv(AL_ORIENTATION, orientation);
 
         std::vector<uint32_t> positionedUsers;
 
@@ -624,7 +642,15 @@ private:
                         ALuint source = it->second.source;
                         positionedUsers.push_back(mapIt->second);
                         alSource3f(source, AL_POSITION, entry.x, entry.y, entry.z);
-                        alSourcef(source, AL_GAIN, 1.0f);
+                        float dx = entry.x - lx, dy = entry.y - ly, dz = entry.z - lz;
+                        float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+                        float gain = 1.0f;
+                        if (dist >= Config::MAX_DISTANCE) gain = 0.0f;
+                        else if (dist > Config::FADE_START) {
+                            float t = (dist - Config::FADE_START) / (Config::MAX_DISTANCE - Config::FADE_START);
+                            gain = 1.0f - t * t;  // quadratic ease-out
+                        }
+                        alSourcef(source, AL_GAIN, gain);
                         if (shmDebugLog) {
                             float dx = entry.x - lx, dy = entry.y - ly, dz = entry.z - lz;
                             float dist = sqrtf(dx*dx + dy*dy + dz*dz);
@@ -644,18 +670,18 @@ private:
             }
         }
 
-        // Any source that cannot be matched to a visible Minecraft entity is muted.
+        // Unmatched sources: move far away so distance model silences them naturally
         {
             std::lock_guard<std::mutex> lock(mgr->dataMutex);
             for (auto& pair : mgr->userAudioMap) {
                 uint32_t ssrc = pair.first;
                 auto& ud = pair.second;
-                if (ud.source == 0) continue;
                 bool mapped = false;
                 for (auto& id : positionedUsers) {
                     if (id == ssrc) { mapped = true; break; }
                 }
-                if (!mapped) {
+                ud.positioned = mapped;
+                if (!mapped && ud.source != 0) {
                     alSourcef(ud.source, AL_GAIN, 0.0f);
                 }
             }
@@ -666,6 +692,22 @@ private:
         std::lock_guard<std::mutex> lock(mgr->dataMutex);
         bool hasActiveAudio = false;
 
+        static ULONGLONG lastBufLog = 0;
+        ULONGLONG nowBuf = GetTickCount64();
+        bool bufLog = (nowBuf - lastBufLog > 5000);
+        if (bufLog) {
+            lastBufLog = nowBuf;
+            uint64_t pc = g_hookProcessCount.load(std::memory_order_relaxed);
+            DebugLog("[Audio] hookProcessCount=%llu", (unsigned long long)pc);
+            for (auto& pair : mgr->userAudioMap) {
+                auto& ud = pair.second;
+                ALint q = 0, st = 0;
+                if (ud.source) { alGetSourcei(ud.source, AL_BUFFERS_QUEUED, &q); alGetSourcei(ud.source, AL_SOURCE_STATE, &st); }
+                DebugLog("[Audio] SSRC=%u ringAvail=%llu queued=%d state=%d positioned=%d",
+                    (unsigned)pair.first, (unsigned long long)ud.Available(), q, st, ud.positioned ? 1 : 0);
+            }
+        }
+
         for (auto& pair : mgr->userAudioMap) { uint32_t ssrc = pair.first; auto& ud = pair.second;
             // Lazy-init AL source on playback thread (thread-safe for OpenAL)
             if (ud.source == 0) {
@@ -674,9 +716,6 @@ private:
                 alSourcef(ud.source, AL_MAX_DISTANCE, Config::MAX_DISTANCE);
                 alSourcef(ud.source, AL_ROLLOFF_FACTOR, Config::ROLLOFF_FACTOR);
                 alSourcei(ud.source, AL_SOURCE_RELATIVE, AL_FALSE);
-                alSourcef(ud.source, AL_MIN_GAIN, 0.0f);
-                alSourcef(ud.source, AL_MAX_GAIN, 1.0f);
-                alSourcef(ud.source, AL_GAIN, 0.0f);
                 DebugLog("Created OpenAL source for SSRC=%u on playback thread", (unsigned)ssrc);
             }
 
@@ -689,36 +728,28 @@ private:
                 alDeleteBuffers(1, &buf);
             }
 
-            // Queue buffers when audio data is available
+            // Always fill up to MAX_QUEUED_BUFFERS (silence if no data)
+            // This prevents sources from ever reaching STOPPED state
             ALint queued = 0;
             alGetSourcei(ud.source, AL_BUFFERS_QUEUED, &queued);
-            uint64_t avail = ud.Available();
-            if (avail > 0) hasActiveAudio = true;
-            while (queued < Config::MAX_QUEUED_BUFFERS && avail >= Config::PLAYBACK_CHUNK) {
-                ud.Read(chunk, Config::PLAYBACK_CHUNK);
+            while (queued < Config::MAX_QUEUED_BUFFERS) {
+                uint64_t avail = ud.Available();
+                if (avail >= Config::PLAYBACK_CHUNK) {
+                    ud.Read(chunk, Config::PLAYBACK_CHUNK);
+                    hasActiveAudio = true;
+                } else {
+                    memset(chunk, 0, Config::PLAYBACK_CHUNK * sizeof(int16_t));
+                }
                 ALuint buffer;
                 alGenBuffers(1, &buffer);
                 alBufferData(buffer, AL_FORMAT_MONO16, chunk,
                     (ALsizei)(Config::PLAYBACK_CHUNK * sizeof(int16_t)), Config::AUDIO_SAMPLE_RATE);
                 alSourceQueueBuffers(ud.source, 1, &buffer);
                 queued++;
-                avail = ud.Available();
             }
 
-            // Prevent underrun: if source is playing and nearly out of buffers,
-            // flush remaining partial data padded with silence
+            // Start playing when enough buffered data
             ALint state;
-            alGetSourcei(ud.source, AL_SOURCE_STATE, &state);
-            if (state == AL_PLAYING && queued <= 1 && avail > 0) {
-                ud.Read(chunk, Config::PLAYBACK_CHUNK); // Read() zero-pads the rest
-                ALuint buffer;
-                alGenBuffers(1, &buffer);
-                alBufferData(buffer, AL_FORMAT_MONO16, chunk,
-                    (ALsizei)(Config::PLAYBACK_CHUNK * sizeof(int16_t)), Config::AUDIO_SAMPLE_RATE);
-                alSourceQueueBuffers(ud.source, 1, &buffer);
-            }
-
-            // Start playing only when we have enough buffered data
             alGetSourcei(ud.source, AL_SOURCE_STATE, &state);
             if (state != AL_PLAYING) {
                 alGetSourcei(ud.source, AL_BUFFERS_QUEUED, &queued);
@@ -827,6 +858,29 @@ void __fastcall Hooked_ConnectUser(void* thisptr, void* userIdStr, int audioSsrc
     if (!userId.empty()) {
         {
             std::lock_guard<std::mutex> lock(g_audioManager.dataMutex);
+            // Remove old SSRC for same userId (SSRC reassignment)
+            uint32_t oldSsrc = 0;
+            for (auto& kv : g_audioManager.ssrcToUserId) {
+                if (kv.second == userId && kv.first != (uint32_t)audioSsrc) {
+                    oldSsrc = kv.first;
+                    break;
+                }
+            }
+            if (oldSsrc != 0) {
+                g_audioManager.ssrcToUserId.erase(oldSsrc);
+                auto it = g_audioManager.userAudioMap.find(oldSsrc);
+                if (it != g_audioManager.userAudioMap.end()) {
+                    if (it->second.source != 0) {
+                        alSourceStop(it->second.source);
+                        ALint p = 0;
+                        alGetSourcei(it->second.source, AL_BUFFERS_PROCESSED, &p);
+                        while (p-- > 0) { ALuint buf; alSourceUnqueueBuffers(it->second.source, 1, &buf); alDeleteBuffers(1, &buf); }
+                        alDeleteSources(1, &it->second.source);
+                    }
+                    g_audioManager.userAudioMap.erase(it);
+                }
+                DebugLog("[ConnectUser] Replaced old SSRC=%u for %s", (unsigned)oldSsrc, userId.c_str());
+            }
             g_audioManager.ssrcToUserId[(uint32_t)audioSsrc] = userId;
         }
         DebugLog("[ConnectUser] SSRC=%d -> %s", audioSsrc, userId.c_str());
@@ -853,17 +907,28 @@ int __fastcall Hooked_GetAudioFrame(void* thisptr, int sample_rate_hz, void* aud
     }
 
     if (discordId.empty()) {
+        static std::mutex unknownMtx;
+        static std::set<uint32_t> loggedUnknown;
+        {
+            std::lock_guard<std::mutex> lock(unknownMtx);
+            if (loggedUnknown.insert(ssrc).second)
+                DebugLog("[Hook] Unknown SSRC=%u (no ConnectUser), silencing", (unsigned)ssrc);
+        }
         SilenceAudioFrame(audio_frame);
         return ret;
     }
 
     bool linked = false;
+    std::string mcName;
     {
         std::lock_guard<std::mutex> linkLock(g_linkMutex);
-        linked = g_discordToMcName.find(discordId) != g_discordToMcName.end();
+        auto it = g_discordToMcName.find(discordId);
+        if (it != g_discordToMcName.end()) {
+            linked = true;
+            mcName = it->second;
+        }
     }
     if (!linked) {
-        QueueDiscordLinkResolve(discordId);
         SilenceAudioFrame(audio_frame);
         return ret;
     }
@@ -876,8 +941,6 @@ int __fastcall Hooked_GetAudioFrame(void* thisptr, int sample_rate_hz, void* aud
             it->second.lastWriteTime = GetTickCount64();
     }
 
-    if (*(char*)((char*)audio_frame + FrameOff::muted) == 1) return ret;
-
     char* frame = (char*)audio_frame;
     size_t samples  = *(size_t*)(frame + FrameOff::samples_per_channel);
     int sr          = *(int*)(frame + FrameOff::sample_rate_hz);
@@ -886,6 +949,7 @@ int __fastcall Hooked_GetAudioFrame(void* thisptr, int sample_rate_hz, void* aud
 
     if (sr > 0 && sr <= 48000 && samples > 0 && samples <= 7680 && channels > 0 && channels <= 2) {
         g_audioManager.ProcessAudioData(ssrc, pcm, samples, (int)channels);
+        g_hookProcessCount.fetch_add(1, std::memory_order_relaxed);
         memset(pcm, 0, samples * channels * sizeof(int16_t));
     }
 
@@ -944,6 +1008,45 @@ static void HandleUdpCommand(const char* data, int len, sockaddr_in* from) {
     if (data[0] == 'P') {
         const char* pong = "PONG\n";
         sendto(g_udpSocket, pong, (int)strlen(pong), 0, (sockaddr*)from, sizeof(*from));
+    }
+    else if (data[0] == 'L') {
+        // Link command: L<discordId>:<mcName>
+        std::string payload(data + 1, len - 1);
+        size_t sep = payload.find(':');
+        if (sep != std::string::npos && sep > 0 && sep < payload.size() - 1) {
+            std::string discordId = payload.substr(0, sep);
+            std::string mcName = payload.substr(sep + 1);
+            {
+                std::lock_guard<std::mutex> lock(g_linkMutex);
+                g_discordToMcName[discordId] = mcName;
+                g_linkResolvePending.erase(discordId);
+                g_linkResolveRetryAt.erase(discordId);
+            }
+            DebugLog("[CMD] Linked %s -> %s", discordId.c_str(), mcName.c_str());
+            char resp[128];
+            snprintf(resp, sizeof(resp), "LINKED %s -> %s\n", discordId.c_str(), mcName.c_str());
+            sendto(g_udpSocket, resp, (int)strlen(resp), 0, (sockaddr*)from, sizeof(*from));
+        } else {
+            const char* err = "ERR: format L<discordId>:<mcName>\n";
+            sendto(g_udpSocket, err, (int)strlen(err), 0, (sockaddr*)from, sizeof(*from));
+        }
+    }
+    else if (data[0] == 'U') {
+        // Unlink command: U<discordId>
+        std::string discordId(data + 1, len - 1);
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(g_linkMutex);
+            auto it = g_discordToMcName.find(discordId);
+            if (it != g_discordToMcName.end()) {
+                g_discordToMcName.erase(it);
+                found = true;
+            }
+        }
+        DebugLog("[CMD] Unlinked %s (%s)", discordId.c_str(), found ? "found" : "not found");
+        char resp[128];
+        snprintf(resp, sizeof(resp), "UNLINKED %s (%s)\n", discordId.c_str(), found ? "ok" : "not found");
+        sendto(g_udpSocket, resp, (int)strlen(resp), 0, (sockaddr*)from, sizeof(*from));
     }
     else if (data[0] == 'Q') {
         const char* ack = "UNLOADING\n";
@@ -1101,6 +1204,44 @@ static DWORD WINAPI ConsoleCommandThread(LPVOID) {
                 FreeConsole();
                 if (hConsole) PostMessage(hConsole, WM_CLOSE, 0, 0);
                 FreeLibraryAndExitThread(g_hModule, 0);
+            }
+            else if (strncmp(buffer, "link ", 5) == 0) {
+                // link <discordId> <mcName>
+                char* args = buffer + 5;
+                char* space = strchr(args, ' ');
+                if (space && space > args && *(space + 1)) {
+                    std::string discordId(args, space - args);
+                    std::string mcName(space + 1);
+                    {
+                        std::lock_guard<std::mutex> lock(g_linkMutex);
+                        g_discordToMcName[discordId] = mcName;
+                        g_linkResolvePending.erase(discordId);
+                        g_linkResolveRetryAt.erase(discordId);
+                    }
+                    DebugLog("[CMD] Linked %s -> %s", discordId.c_str(), mcName.c_str());
+                } else {
+                    DebugLog("Usage: link <discordId> <mcName>");
+                }
+            }
+            else if (strncmp(buffer, "unlink ", 7) == 0) {
+                std::string discordId(buffer + 7);
+                bool found = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_linkMutex);
+                    auto it = g_discordToMcName.find(discordId);
+                    if (it != g_discordToMcName.end()) {
+                        g_discordToMcName.erase(it);
+                        found = true;
+                    }
+                }
+                DebugLog("[CMD] Unlinked %s (%s)", discordId.c_str(), found ? "found" : "not found");
+            }
+            else if (strcmp(buffer, "links") == 0) {
+                std::lock_guard<std::mutex> lock(g_linkMutex);
+                DebugLog("=== Discord -> MC Name ===");
+                for (auto& p : g_discordToMcName)
+                    DebugLog("  %s -> %s", p.first.c_str(), p.second.c_str());
+                if (g_discordToMcName.empty()) DebugLog("  (empty)");
             }
             else if (strcmp(buffer, "list") == 0) {
                 std::lock_guard<std::mutex> lock(g_audioManager.dataMutex);
