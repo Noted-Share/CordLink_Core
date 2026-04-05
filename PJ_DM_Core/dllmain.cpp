@@ -414,6 +414,7 @@ public:
     std::atomic<bool> initialized{ false };
     std::atomic<bool> running{ false };
     HANDLE playbackThread = nullptr;
+    HANDLE rotationThread = nullptr;
 
     ALCdevice* device = nullptr;
     ALCcontext* context = nullptr;
@@ -455,6 +456,7 @@ public:
     void StartPlayback() {
         running = true;
         playbackThread = CreateThread(nullptr, 0, PlaybackThreadFunc, this, 0, nullptr);
+        rotationThread = CreateThread(nullptr, 0, RotationThreadFunc, this, 0, nullptr);
     }
 
     void CleanupAllSources() {
@@ -525,17 +527,7 @@ private:
         }
         if (!mgr->shmView) return;
 
-        // Always apply live rotation (outside seqlock, updated at ~500Hz)
-        {
-            float liveYaw, livePitch;
-            memcpy(&liveYaw,   mgr->shmView + Config::LIVE_ROTATION_OFFSET, 4);
-            memcpy(&livePitch, mgr->shmView + Config::LIVE_ROTATION_OFFSET + 4, 4);
-            float fx = -sinf(liveYaw) * cosf(livePitch);
-            float fy = -sinf(livePitch);
-            float fz = cosf(liveYaw) * cosf(livePitch);
-            ALfloat orientation[] = { fx, fy, fz, 0.0f, 1.0f, 0.0f };
-            alListenerfv(AL_ORIENTATION, orientation);
-        }
+        // Rotation is handled by RotationThread (independent SHM, ~1ms)
 
         // Master volume from SHM (outside seqlock)
         {
@@ -781,6 +773,47 @@ private:
             DebugLog("[Cleanup] Removed inactive SSRC=%u", (unsigned)id);
         }
         return hasActiveAudio;
+    }
+
+    static DWORD WINAPI RotationThreadFunc(LPVOID param) {
+        auto* mgr = (UserAudioManager*)param;
+        timeBeginPeriod(1);
+
+        // Own SHM handle — independent of PlaybackThread
+        HANDLE localHandle = nullptr;
+        uint8_t* localView = nullptr;
+
+        while (mgr->running) {
+            if (!localView) {
+                localHandle = OpenFileMappingA(FILE_MAP_READ, FALSE, "CordlinkPositionData");
+                if (localHandle) {
+                    localView = (uint8_t*)MapViewOfFile(localHandle, FILE_MAP_READ, 0, 0, Config::SHM_SIZE);
+                    if (!localView) {
+                        CloseHandle(localHandle);
+                        localHandle = nullptr;
+                    }
+                }
+            }
+
+            if (localView) {
+                float yaw, pitch;
+                memcpy(&yaw,   localView + Config::LIVE_ROTATION_OFFSET, 4);
+                memcpy(&pitch, localView + Config::LIVE_ROTATION_OFFSET + 4, 4);
+                // OpenAL-Soft internally mutex-protects al* calls,
+                // so alListenerfv is safe here even without alcMakeContextCurrent.
+                float fx = -sinf(yaw) * cosf(pitch);
+                float fy = -sinf(pitch);
+                float fz =  cosf(yaw) * cosf(pitch);
+                ALfloat ori[] = { fx, fy, fz, 0.0f, 1.0f, 0.0f };
+                alListenerfv(AL_ORIENTATION, ori);
+            }
+            Sleep(1);
+        }
+
+        if (localView)   UnmapViewOfFile(localView);
+        if (localHandle)  CloseHandle(localHandle);
+        timeEndPeriod(1);
+        return 0;
     }
 
     static DWORD WINAPI PlaybackThreadFunc(LPVOID param) {
@@ -1070,6 +1103,11 @@ static void HandleUdpCommand(const char* data, int len, sockaddr_in* from) {
                 CloseHandle(g_audioManager.playbackThread);
                 g_audioManager.playbackThread = nullptr;
             }
+            if (g_audioManager.rotationThread) {
+                WaitForSingleObject(g_audioManager.rotationThread, 1000);
+                CloseHandle(g_audioManager.rotationThread);
+                g_audioManager.rotationThread = nullptr;
+            }
 
             // 4. Remove hooks (safe now, no threads using them)
             CleanupHooks();
@@ -1193,6 +1231,11 @@ static DWORD WINAPI ConsoleCommandThread(LPVOID) {
                 Sleep(200);
                 StopUdpReceiver();
                 g_audioManager.running = false;
+                if (g_audioManager.rotationThread) {
+                    WaitForSingleObject(g_audioManager.rotationThread, 1000);
+                    CloseHandle(g_audioManager.rotationThread);
+                    g_audioManager.rotationThread = nullptr;
+                }
                 if (g_audioManager.playbackThread) {
                     WaitForSingleObject(g_audioManager.playbackThread, 2000);
                     CloseHandle(g_audioManager.playbackThread);
@@ -1280,6 +1323,11 @@ static DWORD WINAPI InitThread(LPVOID) {
     if (!InitializeHooks()) {
         DebugLog("Hook init failed");
         g_audioManager.running = false;
+        if (g_audioManager.rotationThread) {
+            WaitForSingleObject(g_audioManager.rotationThread, 1000);
+            CloseHandle(g_audioManager.rotationThread);
+            g_audioManager.rotationThread = nullptr;
+        }
         if (g_audioManager.playbackThread) {
             WaitForSingleObject(g_audioManager.playbackThread, 3000);
             CloseHandle(g_audioManager.playbackThread);
@@ -1316,6 +1364,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         StopConsoleThread();
 #endif
         g_audioManager.running = false;
+        if (g_audioManager.rotationThread) {
+            WaitForSingleObject(g_audioManager.rotationThread, 1000);
+            CloseHandle(g_audioManager.rotationThread);
+            g_audioManager.rotationThread = nullptr;
+        }
         bool pbStopped = true;
         if (g_audioManager.playbackThread) {
             pbStopped = (WaitForSingleObject(g_audioManager.playbackThread, 2000) == WAIT_OBJECT_0);
